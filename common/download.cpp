@@ -207,6 +207,29 @@ public:
     ProgressBar & operator=(const ProgressBar &) = delete;
 };
 
+// chains a ProgressBar with a user callback so both receive events
+class CallbackChain : public common_download_callback {
+    ProgressBar tty_cb;
+    common_download_callback * user_cb;
+public:
+    explicit CallbackChain(common_download_callback * cb) : user_cb(cb) {}
+    void on_start(const common_download_progress & p) override {
+        tty_cb.on_start(p);
+        if (user_cb) user_cb->on_start(p);
+    }
+    void on_update(const common_download_progress & p) override {
+        tty_cb.on_update(p);
+        if (user_cb) user_cb->on_update(p);
+    }
+    void on_done(const common_download_progress & p, bool ok) override {
+        tty_cb.on_done(p, ok);
+        if (user_cb) user_cb->on_done(p, ok);
+    }
+    bool is_cancelled() const override {
+        return user_cb && user_cb->is_cancelled();
+    }
+};
+
 static bool common_pull_file(httplib::Client & cli,
                              const std::string & resolve_path,
                              const std::string & path_tmp,
@@ -259,11 +282,11 @@ static bool common_pull_file(httplib::Client & cli,
             if (progress_step >= p.total / 1000 || p.downloaded == p.total) {
                 if (callback) {
                     callback->on_update(p);
-                    if (callback->is_cancelled()) {
-                        return false;
-                    }
                 }
                 progress_step = 0;
+            }
+            if (callback && callback->is_cancelled()) {
+                return false;
             }
             return true;
         },
@@ -271,6 +294,9 @@ static bool common_pull_file(httplib::Client & cli,
     );
 
     if (!res) {
+        if (callback && callback->is_cancelled()) {
+            return false; // cancelled, don't log error
+        }
         LOG_ERR("%s: download failed: %s (status: %d)\n",
                 __func__,
                 httplib::to_string(res.error()).c_str(),
@@ -414,6 +440,10 @@ static int common_download_file_single_online(const std::string & url,
             success = true;
             break;
         }
+        // don't retry if cancelled
+        if (opts.callback && opts.callback->is_cancelled()) {
+            break;
+        }
     }
 
     if (opts.callback) {
@@ -425,9 +455,12 @@ static int common_download_file_single_online(const std::string & url,
             LOG_ERR("%s: unable to delete temporary file: %s\n", __func__, path_temporary.c_str());
         }
     }
-    if (!success) {
+    if (!success && !(opts.callback && opts.callback->is_cancelled())) {
         LOG_ERR("%s: download failed after %d attempts\n", __func__, max_attempts);
         return -1; // max attempts reached
+    }
+    if (!success) {
+        return -1; // cancelled
     }
 
     return head->status;
@@ -472,11 +505,12 @@ int common_download_file_single(const std::string & url,
                                 const common_download_opts & opts,
                                 bool skip_etag) {
     if (!opts.offline) {
-        ProgressBar tty_cb;
         common_download_opts online_opts = opts;
-        if (!online_opts.callback) {
-            online_opts.callback = &tty_cb;
+        CallbackChain chain(online_opts.callback);
+        if (opts.progress_bar) {
+            online_opts.callback = &chain;
         }
+
         return common_download_file_single_online(url, path, online_opts, skip_etag);
     }
 
